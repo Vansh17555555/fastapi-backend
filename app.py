@@ -8,17 +8,23 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 import aiohttp
 import os
+import json
 from dotenv import load_dotenv
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
-# Allow CORS for trusted domains (adjust for production)
+# Allow CORS for trusted domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with specific domains in production
+    allow_origins=["https://yoom-htm.vercel.app"],  # Add your frontend URL here
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,36 +59,46 @@ async def process_jsonl(url: str) -> str:
                             transcription_text += data.get('text', '') + " "
                 return transcription_text
     except aiohttp.ClientError as e:
+        logger.error(f"Error fetching transcription: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching transcription: {str(e)}")
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Invalid JSON data received")
-
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON data received: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Invalid JSON data received: {str(e)}")
 
 def update_vector_store(text: str):
     """
     Update the FAISS vector store with new text chunks.
     """
     global vector_store
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = text_splitter.split_text(text)
-    if vector_store is None:
-        vector_store = FAISS.from_texts(chunks, embedding=embeddings)
-        vector_store.save_local("faiss_index")  # Save the initial vector store
-    else:
-        vector_store.add_texts(chunks)
-        vector_store.save_local("faiss_index")  # Update the saved vector store
-
+    try:
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_text(text)
+        if vector_store is None:
+            vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+            vector_store.save_local("faiss_index")  # Save the initial vector store
+        else:
+            vector_store.add_texts(chunks)
+            vector_store.save_local("faiss_index")  # Update the saved vector store
+        logger.info("Vector store updated successfully")
+    except Exception as e:
+        logger.error(f"Error updating vector store: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating vector store: {str(e)}")
 
 def load_vector_store():
     """
     Load the FAISS vector store from disk.
     """
     global vector_store
-    if os.path.exists("faiss_index"):
-        vector_store = FAISS.load_local("faiss_index", embeddings)
-    else:
+    try:
+        if os.path.exists("faiss_index"):
+            vector_store = FAISS.load_local("faiss_index", embeddings)
+            logger.info("Vector store loaded successfully")
+        else:
+            vector_store = None
+            logger.warning("No existing vector store found")
+    except Exception as e:
+        logger.error(f"Error loading vector store: {str(e)}")
         vector_store = None
-
 
 # FastAPI Endpoints
 @app.post("/process_transcription")
@@ -90,15 +106,20 @@ async def process_transcription(request: Request):
     """
     Endpoint to process transcription from a given URL.
     """
-    body = await request.json()
-    url = body.get('url')
-    if not url:
-        raise HTTPException(status_code=400, detail="No URL provided")
-    
-    transcription_text = await process_jsonl(url)
-    update_vector_store(transcription_text)
-    return {"message": "Transcription processed successfully", "transcription_text": transcription_text}
-
+    try:
+        body = await request.json()
+        url = body.get('url')
+        if not url:
+            raise HTTPException(status_code=400, detail="No URL provided")
+        
+        transcription_text = await process_jsonl(url)
+        update_vector_store(transcription_text)
+        return {"message": "Transcription processed successfully", "transcription_text": transcription_text}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error in process_transcription: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/chat")
 async def chat(request: Request):
@@ -106,26 +127,30 @@ async def chat(request: Request):
     Endpoint to interact with the conversational retrieval chain.
     """
     global vector_store
-    body = await request.json()
-    user_question = body.get('question', '')
+    try:
+        body = await request.json()
+        user_question = body.get('question', '')
 
-    if vector_store is None:
-        raise HTTPException(status_code=400, detail="No transcription data available. Please process a transcription first.")
-    
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vector_store.as_retriever(),
-        memory=memory
-    )
-    response = chain({"question": user_question})
-    return {"reply": response["answer"]}
-
+        if vector_store is None:
+            raise HTTPException(status_code=400, detail="No transcription data available. Please process a transcription first.")
+        
+        chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=vector_store.as_retriever(),
+            memory=memory
+        )
+        response = chain({"question": user_question})
+        return {"reply": response["answer"]}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # Load the vector store on startup
 @app.on_event("startup")
 async def startup_event():
     load_vector_store()
-
 
 # Main entry point
 if __name__ == "__main__":
